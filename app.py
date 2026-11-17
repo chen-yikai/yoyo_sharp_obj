@@ -425,23 +425,16 @@ def draw_gap_ruler(img, g, color, cm_per_px, ttc_s, major: bool):
     _label(img, text, mx, my, color, 0.75 if major else 0.5, 2 if major else 1)
 
 
-def notify(title: str, detail: str, urgent: bool = False):
-    """Non-blocking sound + desktop notification."""
-    try:
-        if sys.platform == "darwin":
-            sound = "/System/Library/Sounds/" + ("Sosumi.aiff" if urgent else "Funk.aiff")
+def play_alert(root: tk.Misc, urgent: bool = False):
+    """Non-blocking warning sound (macOS system sound, else the Tk bell)."""
+    if sys.platform == "darwin":
+        sound = "/System/Library/Sounds/" + ("Sosumi.aiff" if urgent else "Funk.aiff")
+        try:
             subprocess.Popen(["afplay", sound], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            esc = lambda t: t.replace("\\", "\\\\").replace('"', '\\"')
-            subprocess.Popen(["osascript", "-e",
-                              f'display notification "{esc(detail)}" with title "{esc(title)}"'],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif sys.platform.startswith("linux"):
-            subprocess.Popen(["notify-send", "-u", "critical" if urgent else "normal", title, detail],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            print("\a", end="", flush=True)
-    except OSError:
-        pass
+            return
+        except OSError:
+            pass
+    root.bell()
 
 
 class App:
@@ -555,7 +548,7 @@ class App:
             ttk.Label(row, text=text).pack(side="left")
             ttk.Spinbox(row, from_=0.5, to=50, increment=0.5, width=5, textvariable=var,
                         command=self._zone_changed).pack(side="right")
-        ttk.Checkbutton(zone, text="Sound + desktop notification on danger",
+        ttk.Checkbutton(zone, text="Warning sound on danger",
                         variable=self.alerts_on).pack(anchor="w", pady=(4, 0))
 
         meas = ttk.LabelFrame(side, text="Measurement", padding=6)
@@ -812,8 +805,7 @@ class App:
                       f"CONTACT — {g.part.upper()} {dist} FROM {item.upper()}"),
         }[a.level]
         self._set_banner(title, detail, LEVEL_UI[a.level])
-        self._maybe_notify(a.level, title, detail,
-                           approaching=a.speed_cm_s is None or a.speed_cm_s > -2)
+        self._maybe_alert(a.level, approaching=a.speed_cm_s is None or a.speed_cm_s > -2)
         self.last_level = a.level
 
     def _set_banner(self, title: str, detail: str, bg: str):
@@ -821,8 +813,8 @@ class App:
         self.alert.configure(text=title, bg=bg)
         self.gap_lbl.configure(text=detail, bg=bg)
 
-    def _maybe_notify(self, level: str, title: str, detail: str, approaching: bool = True):
-        """Beep + desktop notification when entering DANGER/CONTACT (max every 2 s)."""
+    def _maybe_alert(self, level: str, approaching: bool = True):
+        """Warning sound when entering DANGER/CONTACT; repeats every 3 s while still closing in."""
         if not self.alerts_on.get() or LEVEL_RANK[level] < LEVEL_RANK[DANGER]:
             return
         now = time.monotonic()
@@ -834,7 +826,7 @@ class App:
         elif not (still_in_danger and approaching and now - self.last_alert_t >= 3.0):
             return  # no repeat alerts while backing away
         self.last_alert_t = now
-        notify(title, detail, urgent=level == CONTACT)
+        play_alert(self.root, urgent=level == CONTACT)
 
     def on_close(self):
         self.stop()

@@ -47,7 +47,7 @@ uv run app.py --source photo.jpg --autostart
 
 Contact time counts too, so a hand moving quickly toward a blade turns DANGER while it's still far away. The second line of the banner shows which part of the hand is closest, the gap, and the approach speed. The caution and danger distances are adjustable in the **Danger zone** panel.
 
-When the level rises to DANGER or CONTACT, the app plays a sound and shows a desktop notification (macOS: Notification Center; Linux: `notify-send`). It repeats every 3 s while you stay in danger and keep moving closer, and stays quiet while you move away. Turn this off with the checkbox.
+When the level rises to DANGER or CONTACT, the app plays a warning sound (a sharper one for CONTACT). It repeats every 3 s while you stay in danger and keep moving closer, and stays quiet while you move away. Turn it off with the checkbox.
 
 **Measures lengths.**
 - **Sharp items** are measured along their long axis (the line drawn on each item), not the box diagonal.
@@ -85,7 +85,7 @@ The whole app, including hand tracking and drawing, runs at about 10–25 FPS.
 | Input size | 960 or 1280 helps with small tips (pen nibs, pins) but runs slower |
 | Sharp classes → **Apply** | Use your edited list without stopping the camera |
 | **Calibrate…** / `Esc` | Start / cancel calibration |
-| Danger zone | Caution / danger distances in cm, plus the sound + notification switch |
+| Danger zone | Caution / danger distances in cm, plus the warning-sound switch |
 
 ## Limitations
 
