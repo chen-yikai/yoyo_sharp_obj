@@ -771,11 +771,12 @@ class App:
         for i in order:
             d = r.dets[i]
             gap = gap_text(gaps[i], r.cm_per_px) if i in gaps else "no hand"
-            mark = {SAFE: " ", CAUTION: "!", DANGER: "⚠", CONTACT: "⛔"}[d.level]
-            self.det_list.insert("end", f"{mark} {d.label[:11]:<11} {gap:>8} "
+            self.det_list.insert("end", f"  {d.label[:11]:<11} {gap:>8} "
                                         f"{fmt_len(d.length_px, r.cm_per_px):>7}")
+            if d.level != SAFE:  # colour the row like the banner instead of an icon
+                self.det_list.itemconfigure("end", foreground=LEVEL_UI[d.level])
         for h, fcm in zip(r.hands, r.finger_cm):
-            self.det_list.insert("end", f"✋ {h.side} hand (cm{', est.' if not self.cm_per_px else ''})")
+            self.det_list.insert("end", f"  {h.side} hand (cm{', est.' if not self.cm_per_px else ''})")
             for name, v in fcm.items():
                 self.det_list.insert("end", f"     {name:<8} {v:5.1f} cm")
 
@@ -806,9 +807,9 @@ class App:
         title = {
             SAFE: f"SAFE — {item.upper()} {dist} AWAY",
             CAUTION: f"CAUTION — HAND {dist} FROM {item.upper()}",
-            DANGER: f"⚠ DANGER — {g.part.upper()} {dist} FROM {item.upper()}",
-            CONTACT: (f"⛔ CONTACT — {g.part.upper()} TOUCHING {item.upper()}" if g.px < 1 else
-                      f"⛔ CONTACT — {g.part.upper()} {dist} FROM {item.upper()}"),
+            DANGER: f"DANGER — {g.part.upper()} {dist} FROM {item.upper()}",
+            CONTACT: (f"CONTACT — {g.part.upper()} TOUCHING {item.upper()}" if g.px < 1 else
+                      f"CONTACT — {g.part.upper()} {dist} FROM {item.upper()}"),
         }[a.level]
         self._set_banner(title, detail, LEVEL_UI[a.level])
         self._maybe_notify(a.level, title, detail,

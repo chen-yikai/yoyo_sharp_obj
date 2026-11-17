@@ -40,10 +40,10 @@ uv run app.py --source photo.jpg --autostart
 
 | Banner | When |
 |---|---|
-| 🟩 SAFE | No sharp item, or the gap is more than the caution distance |
-| 🟧 CAUTION | Gap ≤ 10 cm, or contact expected within 2 s |
-| 🟥 DANGER | Gap ≤ 4 cm, or contact expected within 0.8 s |
-| 🟪 CONTACT | Gap ≤ 1 cm, or touching |
+| SAFE (green) | No sharp item, or the gap is more than the caution distance |
+| CAUTION (orange) | Gap ≤ 10 cm, or contact expected within 2 s |
+| DANGER (red) | Gap ≤ 4 cm, or contact expected within 0.8 s |
+| CONTACT (purple) | Gap ≤ 1 cm, or touching |
 
 Contact time counts too, so a hand moving quickly toward a blade turns DANGER while it's still far away. The second line of the banner shows which part of the hand is closest, the gap, and the approach speed. The caution and danger distances are adjustable in the **Danger zone** panel.
 
