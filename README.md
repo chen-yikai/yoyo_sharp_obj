@@ -1,10 +1,10 @@
 # Sharp Object Identifier
 
-Live detection of sharp items from your desktop camera, with a Tkinter UI. It finds blades, points and needles with YOLO, tracks your hands and fingers with MediaPipe, warns when a sharp item gets close to a hand, and measures the length of every item and finger.
+Live detection of sharp items from your desktop camera, with a Tkinter UI. It finds blades, points and needles with YOLO and tracks your hands and fingers with MediaPipe. It then measures **how far your hand is from each sharp item and how soon it will touch it**, and warns you before contact. It also measures the length of every item and finger.
 
 ![Sharp Object Identifier warning that a sharp item is near a hand](docs/screenshot.png)
 
-*A statue's hand holding a stylus (still-image source, YOLO-World L). The stylus is flagged and measured along its length, the hand's skeleton and finger lengths are shown, and the banner turns red because the item is touching the hand. Note the label says "knife": the model often picks the wrong name for an item even when it correctly flags it as sharp. See [Limitations](#limitations).*
+*Test video: a knife moving toward a photo of real hands (YOLO-World L, scale estimated from hand size). The ruler line runs from the closest point on the hand (the pinky tip) to the closest point on the knife, with a tick every centimetre. The banner shows the gap (5.8 cm), the approach speed and the time to contact (1.4 s). The speed is low because the test video played slower than real time.*
 
 ## Quick start
 
@@ -32,13 +32,22 @@ uv run app.py --source photo.jpg --autostart
 
 **Ignores harmless look-alikes.** Spoons, chopsticks, markers, phones and similar items are also given to the model as options, then dropped from the results. That gives the model a better name for a spoon than "knife".
 
-**Tracks hands and fingers.** MediaPipe finds 21 points on each hand and draws a skeleton over it. The banner shows:
+**Tracks hands and fingers.** MediaPipe finds 21 points on each hand and draws a skeleton over it.
 
-| Banner | Meaning |
+**Measures the gap between your hand and each sharp item.** A ruler line is drawn from the closest point on the hand (fingertip, finger or palm) to the closest point on the item. It is labelled with the gap in cm and, when you're moving toward the item, the time to contact.
+
+**Warns you before contact:**
+
+| Banner | When |
 |---|---|
-| 🟩 NO SHARP OBJECTS | Nothing sharp in view |
-| 🟧 SHARP OBJECT: … | Sharp item in view |
-| 🟥 DANGER: … NEAR HAND | A sharp item overlaps or touches a hand |
+| 🟩 SAFE | No sharp item, or the gap is more than the caution distance |
+| 🟧 CAUTION | Gap ≤ 10 cm, or contact expected within 2 s |
+| 🟥 DANGER | Gap ≤ 4 cm, or contact expected within 0.8 s |
+| 🟪 CONTACT | Gap ≤ 1 cm, or touching |
+
+Contact time counts too, so a hand moving quickly toward a blade turns DANGER while it's still far away. The second line of the banner shows which part of the hand is closest, the gap, and the approach speed. The caution and danger distances are adjustable in the **Danger zone** panel.
+
+When the level rises to DANGER or CONTACT, the app plays a sound and shows a desktop notification (macOS: Notification Center; Linux: `notify-send`). It repeats every 3 s while you stay in danger and keep moving closer, and stays quiet while you move away. Turn this off with the checkbox.
 
 **Measures lengths.**
 - **Sharp items** are measured along their long axis (the line drawn on each item), not the box diagonal.
@@ -76,14 +85,17 @@ The whole app, including hand tracking and drawing, runs at about 10–25 FPS.
 | Input size | 960 or 1280 helps with small tips (pen nibs, pins) but runs slower |
 | Sharp classes → **Apply** | Use your edited list without stopping the camera |
 | **Calibrate…** / `Esc` | Start / cancel calibration |
+| Danger zone | Caution / danger distances in cm, plus the sound + notification switch |
 
 ## Limitations
 
 - **Labels are often wrong even when detection is right.** In testing, a fountain pen and a thumbtack were both flagged as sharp but labelled "scissors", and a stylus was labelled "knife". Treat the label as a hint and the warning as the signal.
 - **There are false alarms.** A porcelain soup spoon was flagged as "scissors". Raise the confidence threshold, or remove classes you don't need.
 - **Small and thin points** (pen nibs, needles, razor blades) are hard to see at webcam resolution. Bring them closer or raise the input size.
-- **Hand tracking is built for real hands.** It handles live webcam hands well but can miss unusual ones; a marble statue's hand stopped being detected after video compression.
-- **Lengths are 2D estimates.** Items or fingers tilted toward the camera measure short, and the "near hand" check is a 2D overlap test, not true depth.
+- **Hand tracking is built for real hands** and can miss unusual ones; a marble statue's hand stopped being detected after video compression. Gloves, bad lighting and hands partly out of frame are likely to make it worse (not yet tested).
+- **Gaps are measured in the image plane, not in 3D.** A hand hovering *above* a knife, nearer the camera, can show a gap of 0 cm without touching it. A single webcam can't see depth, so mount it looking down on the work surface and treat CONTACT as "about to touch". Items or fingers tilted toward the camera also measure short.
+- **The cm scale is an estimate unless you calibrate.** Without calibration the scale comes from your hand's estimated size, so gaps can be off by roughly 10–20%. Calibrate for real measurements.
+- **Detection can lag or miss frames.** If an item isn't detected for a few frames, no warning is shown for it. Don't rely on the app alone.
 - **This is a demo, not a safety system.** Don't rely on it to protect anyone. For dependable results, train a YOLO model on labelled photos of your own objects.
 
 ## Files
@@ -92,6 +104,7 @@ The whole app, including hand tracking and drawing, runs at about 10–25 FPS.
 app.py            Tk UI, camera worker, YOLO detection, drawing
 hands.py          MediaPipe hand + finger tracking and finger lengths
 measure.py        Item length along its axis, px → cm formatting
+proximity.py      Hand ↔ item gap, approach speed, time to contact, danger levels
 pyproject.toml    Dependencies (uv)
 docs/screenshot.png
 models/           Hand model, downloaded on first run

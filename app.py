@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import subprocess
 import queue
 import statistics
 import sys
@@ -31,6 +32,8 @@ from PIL import Image, ImageTk
 
 from hands import SKELETON, TIPS, FINGERS, Hand, HandTracker
 from measure import fmt_len, item_axis
+from proximity import (CAUTION, CONTACT, DANGER, LEVEL_RANK, SAFE, Assessment,
+                       ProximityMonitor, Thresholds)
 
 # Anything with an edge or point that can cut or puncture a hand.
 DEFAULT_SHARP_CLASSES = [
@@ -63,11 +66,13 @@ MODELS = {
 }
 
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
-SHARP_COLOR = (0, 140, 255)   # BGR orange
-DANGER_COLOR = (0, 0, 255)    # BGR red
 HAND_COLOR = (255, 160, 0)    # BGR blue
 CAL_COLOR = (0, 220, 0)       # BGR green
-HAND_MARGIN = 0.25            # grow hand box by 25% when checking proximity
+LEVEL_BGR = {SAFE: (60, 160, 30), CAUTION: (0, 165, 255), DANGER: (0, 0, 230),
+             CONTACT: (90, 0, 160)}
+LEVEL_UI = {  # banner background colours
+    SAFE: "#1e7f3c", CAUTION: "#e08a00", DANGER: "#c62828", CONTACT: "#7b1fa2",
+}
 
 
 def pick_device() -> str:
@@ -89,7 +94,7 @@ class Detection:
     conf: float
     box: tuple[int, int, int, int]
     axis: tuple[tuple[int, int], tuple[int, int]] = ((0, 0), (0, 0))
-    near_hand: bool = False
+    level: str = SAFE             # danger level from the hand ↔ item gap
 
     @property
     def length_px(self) -> float:
@@ -106,6 +111,7 @@ class Result:
     model_ready: bool
     fps: float
     finger_cm: list[dict[str, float]] = field(default_factory=list)  # per hand
+    assess: Assessment | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +182,8 @@ class Worker(threading.Thread):
         self.imgsz = imgsz
         self.track_hands = True
         self.cm_per_px: float | None = None   # manual calibration, overrides hand estimate
+        self.thresholds = Thresholds()
+        self.monitor = ProximityMonitor(self.thresholds)
         self.mirror = isinstance(source, int)
         self.device = pick_device()
         self.stop_event = threading.Event()
@@ -266,17 +274,31 @@ class Worker(threading.Thread):
                 dets: list[Detection] = []
                 if model is not None:
                     try:
-                        dets = self._detect(model, wanted, ignore, frame, hands)
+                        dets = self._detect(model, wanted, ignore, frame)
                     except Exception as e:  # noqa: BLE001 — never let a bad frame kill the feed
                         self.status_cb(f"Inference error (skipping frame): {e}")
 
                 cm_per_px, src = self._scale(hands)
+                assess = self.monitor.update(dets, hands, cm_per_px)
+                th = self.thresholds
+                for i, d in enumerate(dets):
+                    g = assess.per_item.get(i)
+                    if g is None or g.cm is None:
+                        continue
+                    if assess.closest is g:
+                        d.level = assess.level  # includes the time-to-contact rule
+                    elif g.cm <= th.contact_cm:
+                        d.level = CONTACT
+                    elif g.cm <= th.danger_cm:
+                        d.level = DANGER
+                    elif g.cm <= th.caution_cm:
+                        d.level = CAUTION
                 finger_cm = [
                     {f: px * self.cm_per_px for f, px in h.finger_px.items()}
                     if self.cm_per_px else dict(h.finger_cm_est)
                     for h in hands
                 ]
-                annotated = draw(frame, dets, hands, cm_per_px, finger_cm)
+                annotated = draw(frame, dets, hands, cm_per_px, finger_cm, assess)
 
                 now = time.perf_counter()
                 fps = 0.9 * fps + 0.1 * (1.0 / max(now - last, 1e-6))
@@ -288,7 +310,7 @@ class Worker(threading.Thread):
                 except queue.Empty:
                     pass
                 self.out.put(Result(annotated, dets, hands, cm_per_px, src,
-                                    model is not None, fps, finger_cm))
+                                    model is not None, fps, finger_cm, assess))
         finally:
             cam.release()
             if tracker:
@@ -302,7 +324,7 @@ class Worker(threading.Thread):
             return statistics.median(est), "hand estimate"
         return None, "none"
 
-    def _detect(self, model, wanted, ignore, frame, hands: list[Hand]):
+    def _detect(self, model, wanted, ignore, frame):
         res = model.predict(frame, conf=self.conf, imgsz=self.imgsz,
                             classes=wanted, device=self.device, verbose=False,
                             agnostic_nms=True)[0]  # one label per object, so decoys win
@@ -312,21 +334,11 @@ class Worker(threading.Thread):
             if label in ignore:
                 continue
             box = tuple(map(int, b.xyxy[0].tolist()))
-            dets.append(Detection(label, float(b.conf), box, item_axis(frame, box),
-                                  any(near(box, h.box) for h in hands)))
+            dets.append(Detection(label, float(b.conf), box, item_axis(frame, box)))
         return dets
 
     def stop(self):
         self.stop_event.set()
-
-
-def near(a, b) -> bool:
-    """True if box a overlaps box b grown by HAND_MARGIN of its size."""
-    bx1, by1, bx2, by2 = b
-    mx, my = (bx2 - bx1) * HAND_MARGIN, (by2 - by1) * HAND_MARGIN
-    bx1, by1, bx2, by2 = bx1 - mx, by1 - my, bx2 + mx, by2 + my
-    ax1, ay1, ax2, ay2 = a
-    return ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1
 
 
 def _label(img, text, x, y, color, scale=0.7, thick=2):
@@ -336,8 +348,12 @@ def _label(img, text, x, y, color, scale=0.7, thick=2):
     cv2.putText(img, text, (x + 5, y - 6), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thick)
 
 
+def gap_text(g, cm_per_px) -> str:
+    return fmt_len(g.px, cm_per_px) if g.px > 0 else "touching"
+
+
 def draw(frame, dets: list[Detection], hands: list[Hand] = (), cm_per_px=None,
-         finger_cm: list[dict] = ()):
+         finger_cm: list[dict] = (), assess: Assessment | None = None):
     img = frame.copy()
     for h, fcm in zip(hands, finger_cm or [{}] * len(hands)):
         for a, b in SKELETON:
@@ -350,16 +366,82 @@ def draw(frame, dets: list[Detection], hands: list[Hand] = (), cm_per_px=None,
                 _label(img, f"{fcm[name]:.1f}", x + 6, y - 6, HAND_COLOR, 0.45, 1)
     for d in dets:
         x1, y1, x2, y2 = d.box
-        color = DANGER_COLOR if d.near_hand else SHARP_COLOR
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        color = LEVEL_BGR[d.level] if d.level != SAFE else (0, 140, 255)
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2 + LEVEL_RANK[d.level])
         (ax, ay), (bx, by) = d.axis
         cv2.line(img, (ax, ay), (bx, by), (255, 255, 255), 4)
         cv2.line(img, (ax, ay), (bx, by), color, 2)
         for p in d.axis:
             cv2.circle(img, p, 5, color, -1)
-        text = f"{d.label} {d.conf:.0%}  {fmt_len(d.length_px, cm_per_px)}"
-        _label(img, text + ("  NEAR HAND" if d.near_hand else ""), x1, y1, color)
+        text = f"{d.label} {d.conf:.0%}  len {fmt_len(d.length_px, cm_per_px)}"
+        _label(img, text + (f"  {d.level}" if d.level != SAFE else ""), x1, y1, color)
+
+    # Gap rulers: hand ↔ item, for every item (closest one drawn thickest).
+    if assess:
+        for i, g in assess.per_item.items():
+            draw_gap_ruler(img, g, LEVEL_BGR[dets[i].level], cm_per_px,
+                           assess.ttc_s if assess.closest is g else None,
+                           major=assess.closest is g)
     return img
+
+
+def draw_gap_ruler(img, g, color, cm_per_px, ttc_s, major: bool):
+    """A measuring line from the closest point on the hand to the closest point
+    on the item: end caps, a tick every cm, and the gap (+ time to contact)."""
+    (hx, hy), (ix, iy) = g.p_hand, g.p_item
+    ph, pi = (int(hx), int(hy)), (int(ix), int(iy))
+    if g.px < 1:  # touching: mark the contact point
+        cv2.circle(img, ph, 14 if major else 9, color, 3)
+        cv2.circle(img, ph, 4, color, -1)
+        _label(img, "TOUCHING", ph[0] + 16, ph[1], color, 0.75 if major else 0.5, 2 if major else 1)
+        return
+    ux, uy = (ix - hx) / g.px, (iy - hy) / g.px   # unit vector hand → item
+    nx, ny = -uy, ux                               # perpendicular, for ticks
+    thick = 3 if major else 1
+    cv2.line(img, ph, pi, (255, 255, 255), thick + 3)
+    cv2.line(img, ph, pi, color, thick)
+    cap = 12 if major else 7
+    for x, y in (ph, pi):  # end caps
+        cv2.line(img, (int(x - nx * cap), int(y - ny * cap)),
+                 (int(x + nx * cap), int(y + ny * cap)), color, thick + 1)
+    if cm_per_px and major:  # tick every cm (every 5 cm if that gets crowded)
+        step_cm = 1 if g.px * cm_per_px <= 30 else 5
+        step_px = step_cm / cm_per_px
+        if step_px >= 6:
+            k = 1
+            while k * step_px < g.px - 2:
+                t = k * step_px
+                x, y = hx + ux * t, hy + uy * t
+                size = 8 if (k * step_cm) % 5 == 0 else 5
+                cv2.line(img, (int(x - nx * size), int(y - ny * size)),
+                         (int(x + nx * size), int(y + ny * size)), color, 2)
+                k += 1
+    text = fmt_len(g.px, cm_per_px)
+    if ttc_s is not None:
+        text += f" | contact in {ttc_s:.1f}s"
+    if ny < 0:  # put the label on the lower side of the line (item labels sit on top)
+        nx, ny = -nx, -ny
+    mx, my = int((hx + ix) / 2 + nx * 24), int((hy + iy) / 2 + ny * 24 + 20)
+    _label(img, text, mx, my, color, 0.75 if major else 0.5, 2 if major else 1)
+
+
+def notify(title: str, detail: str, urgent: bool = False):
+    """Non-blocking sound + desktop notification."""
+    try:
+        if sys.platform == "darwin":
+            sound = "/System/Library/Sounds/" + ("Sosumi.aiff" if urgent else "Funk.aiff")
+            subprocess.Popen(["afplay", sound], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            esc = lambda t: t.replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.Popen(["osascript", "-e",
+                              f'display notification "{esc(detail)}" with title "{esc(title)}"'],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif sys.platform.startswith("linux"):
+            subprocess.Popen(["notify-send", "-u", "critical" if urgent else "normal", title, detail],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            print("\a", end="", flush=True)
+    except OSError:
+        pass
 
 
 class App:
@@ -387,6 +469,12 @@ class App:
         self.status = tk.StringVar(value="Idle — press Start")
         self.fps = tk.StringVar(value="")
         self.scale_txt = tk.StringVar(value="Scale: pixels (no hand / not calibrated)")
+        self.thresholds = Thresholds()
+        self.caution_cm = tk.DoubleVar(value=self.thresholds.caution_cm)
+        self.danger_cm = tk.DoubleVar(value=self.thresholds.danger_cm)
+        self.alerts_on = tk.BooleanVar(value=True)
+        self.last_level = SAFE
+        self.last_alert_t = 0.0
 
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -402,9 +490,15 @@ class App:
         main.columnconfigure(0, weight=1)
         main.rowconfigure(1, weight=1)
 
-        self.alert = tk.Label(main, text="CAMERA OFF", font=("Helvetica", 18, "bold"),
-                              bg="#555555", fg="white", pady=6)
-        self.alert.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        top = tk.Frame(main, bg="#555555")
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.alert = tk.Label(top, text="CAMERA OFF", font=("Helvetica", 20, "bold"),
+                              bg="#555555", fg="white", pady=4)
+        self.alert.pack(fill="x")
+        self.gap_lbl = tk.Label(top, text="", font=("Helvetica", 14), bg="#555555", fg="white",
+                                pady=2)
+        self.gap_lbl.pack(fill="x")
+        self.banner = top
 
         self.video = tk.Label(main, bg="black", cursor="crosshair")
         self.video.grid(row=1, column=0, sticky="nsew")
@@ -429,7 +523,7 @@ class App:
                             ("coco", "COCO fast (knife/scissors/fork)")):
             ttk.Radiobutton(mode_box, text=text, value=value, variable=self.mode,
                             command=self._model_changed).pack(anchor="w")
-        ttk.Checkbutton(mode_box, text="Track hands & fingers, warn when near",
+        ttk.Checkbutton(mode_box, text="Track hands & fingers",
                         variable=self.hands, command=self._hands_changed).pack(anchor="w", pady=(4, 0))
 
         row = ttk.Frame(side)
@@ -451,6 +545,18 @@ class App:
         self.conf_lbl.pack(anchor="e")
         ttk.Scale(conf_box, from_=0.05, to=0.9, variable=self.conf,
                   command=self._conf_changed).pack(fill="x")
+
+        zone = ttk.LabelFrame(side, text="Danger zone (hand ↔ sharp item)", padding=6)
+        zone.pack(fill="x", pady=(8, 0))
+        for text, var in (("Caution within (cm)", self.caution_cm),
+                          ("Danger within (cm)", self.danger_cm)):
+            row = ttk.Frame(zone)
+            row.pack(fill="x")
+            ttk.Label(row, text=text).pack(side="left")
+            ttk.Spinbox(row, from_=0.5, to=50, increment=0.5, width=5, textvariable=var,
+                        command=self._zone_changed).pack(side="right")
+        ttk.Checkbutton(zone, text="Sound + desktop notification on danger",
+                        variable=self.alerts_on).pack(anchor="w", pady=(4, 0))
 
         meas = ttk.LabelFrame(side, text="Measurement", padding=6)
         meas.pack(fill="x", pady=(8, 0))
@@ -477,9 +583,9 @@ class App:
         self.apply_btn.pack(side="left")
         ttk.Button(btns, text="Reset", command=self._reset_classes).pack(side="left", padx=4)
 
-        out_box = ttk.LabelFrame(side, text="Detections & lengths", padding=6)
+        out_box = ttk.LabelFrame(side, text="Sharp items & fingers", padding=6)
         out_box.pack(fill="both", expand=True, pady=(8, 0))
-        self.det_list = tk.Listbox(out_box, height=8, font=("Menlo", 11))
+        self.det_list = tk.Listbox(out_box, height=8, width=32, font=("Menlo", 11))
         self.det_list.pack(fill="both", expand=True)
 
     # ---------- settings ----------
@@ -506,6 +612,15 @@ class App:
     def _hands_changed(self):
         if self.worker:
             self.worker.track_hands = self.hands.get()
+
+    def _zone_changed(self):
+        try:
+            caution, danger = float(self.caution_cm.get()), float(self.danger_cm.get())
+        except (tk.TclError, ValueError):
+            return
+        self.thresholds.caution_cm = max(caution, danger)
+        self.thresholds.danger_cm = min(caution, danger)
+        self.thresholds.contact_cm = min(1.0, self.thresholds.danger_cm / 2)
 
     def _camera_changed(self):
         if self.worker and self.file_source is None:
@@ -577,6 +692,9 @@ class App:
                              self.frames, self.set_status)
         self.worker.track_hands = self.hands.get()
         self.worker.cm_per_px = self.cm_per_px
+        self._zone_changed()
+        self.worker.thresholds = self.thresholds
+        self.worker.monitor = ProximityMonitor(self.thresholds)
         self.worker.start()
         self.start_btn.configure(text="Stop  (space)")
 
@@ -588,7 +706,7 @@ class App:
         self.start_btn.configure(text="Start  (space)")
         self.status.set("Stopped")
         self.fps.set("")
-        self.alert.configure(text="CAMERA OFF", bg="#555555")
+        self._set_banner("CAMERA OFF", "", "#555555")
 
     def snapshot(self):
         if self.last_frame is None:
@@ -644,26 +762,78 @@ class App:
             self.scale_txt.set("Scale: pixels (no hand / not calibrated)")
 
         self.det_list.delete(0, "end")
-        for d in sorted(r.dets, key=lambda d: (not d.near_hand, -d.conf)):
-            self.det_list.insert("end", f"{'⚠' if d.near_hand else ' '} {d.label[:16]:<16} "
-                                        f"{fmt_len(d.length_px, r.cm_per_px):>8}")
+        if r.dets:
+            self.det_list.insert("end", "  item             gap  length")
+        a = r.assess
+        gaps = a.per_item if a else {}
+        order = sorted(range(len(r.dets)),
+                       key=lambda i: (-LEVEL_RANK[r.dets[i].level], gaps[i].px if i in gaps else 1e9))
+        for i in order:
+            d = r.dets[i]
+            gap = gap_text(gaps[i], r.cm_per_px) if i in gaps else "no hand"
+            mark = {SAFE: " ", CAUTION: "!", DANGER: "⚠", CONTACT: "⛔"}[d.level]
+            self.det_list.insert("end", f"{mark} {d.label[:11]:<11} {gap:>8} "
+                                        f"{fmt_len(d.length_px, r.cm_per_px):>7}")
         for h, fcm in zip(r.hands, r.finger_cm):
             self.det_list.insert("end", f"✋ {h.side} hand (cm{', est.' if not self.cm_per_px else ''})")
             for name, v in fcm.items():
                 self.det_list.insert("end", f"     {name:<8} {v:5.1f} cm")
 
-        danger = sorted({d.label for d in r.dets if d.near_hand})
-        sharp = sorted({d.label for d in r.dets})
         if not r.model_ready:
-            self.alert.configure(text="CAMERA LIVE — LOADING MODEL…", bg="#555555")
-        elif danger:
-            self.alert.configure(text=f"⚠ DANGER: {', '.join(danger).upper()} NEAR HAND",
-                                 bg="#c62828")
-        elif sharp:
-            self.alert.configure(text=f"SHARP OBJECT: {', '.join(sharp).upper()}", bg="#e67e22")
-        else:
-            extra = f" ({len(r.hands)} hand{'s' * (len(r.hands) != 1)} tracked)" if r.hands else ""
-            self.alert.configure(text=f"NO SHARP OBJECTS{extra}", bg="#1e7f3c")
+            self._set_banner("CAMERA LIVE — LOADING MODEL…", "", "#555555")
+            return
+        if not r.dets:
+            extra = f"{len(r.hands)} hand{'s' * (len(r.hands) != 1)} tracked" if r.hands else ""
+            self._set_banner("SAFE — NO SHARP OBJECTS", extra, LEVEL_UI[SAFE])
+            self.last_level = SAFE
+            return
+        names = ", ".join(sorted({d.label for d in r.dets})).upper()
+        if not a or a.closest is None:
+            self._set_banner(f"SHARP OBJECT IN VIEW: {names}",
+                             "No hand detected — distance unknown", LEVEL_UI[CAUTION])
+            self.last_level = SAFE
+            return
+
+        g = a.closest
+        item = r.dets[g.item].label
+        dist = gap_text(g, r.cm_per_px)
+        motion = ""
+        if a.speed_cm_s is not None and abs(a.speed_cm_s) >= 2:
+            motion = (f" · approaching {a.speed_cm_s:.0f} cm/s" if a.speed_cm_s > 0
+                      else f" · moving away {-a.speed_cm_s:.0f} cm/s")
+        ttc = f" · contact in {a.ttc_s:.1f} s" if a.ttc_s is not None else ""
+        detail = f"{g.part} ↔ {item}: {dist}{motion}{ttc}"
+        title = {
+            SAFE: f"SAFE — {item.upper()} {dist} AWAY",
+            CAUTION: f"CAUTION — HAND {dist} FROM {item.upper()}",
+            DANGER: f"⚠ DANGER — {g.part.upper()} {dist} FROM {item.upper()}",
+            CONTACT: (f"⛔ CONTACT — {g.part.upper()} TOUCHING {item.upper()}" if g.px < 1 else
+                      f"⛔ CONTACT — {g.part.upper()} {dist} FROM {item.upper()}"),
+        }[a.level]
+        self._set_banner(title, detail, LEVEL_UI[a.level])
+        self._maybe_notify(a.level, title, detail,
+                           approaching=a.speed_cm_s is None or a.speed_cm_s > -2)
+        self.last_level = a.level
+
+    def _set_banner(self, title: str, detail: str, bg: str):
+        self.banner.configure(bg=bg)
+        self.alert.configure(text=title, bg=bg)
+        self.gap_lbl.configure(text=detail, bg=bg)
+
+    def _maybe_notify(self, level: str, title: str, detail: str, approaching: bool = True):
+        """Beep + desktop notification when entering DANGER/CONTACT (max every 2 s)."""
+        if not self.alerts_on.get() or LEVEL_RANK[level] < LEVEL_RANK[DANGER]:
+            return
+        now = time.monotonic()
+        escalated = LEVEL_RANK[level] > LEVEL_RANK[self.last_level]
+        still_in_danger = LEVEL_RANK[self.last_level] >= LEVEL_RANK[DANGER]
+        if escalated:
+            if now - self.last_alert_t < 0.5:
+                return
+        elif not (still_in_danger and approaching and now - self.last_alert_t >= 3.0):
+            return  # no repeat alerts while backing away
+        self.last_alert_t = now
+        notify(title, detail, urgent=level == CONTACT)
 
     def on_close(self):
         self.stop()
