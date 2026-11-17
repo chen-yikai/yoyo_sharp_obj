@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Model weights (downloaded automatically on first run)
+*.pt
+*.onnx
+*.mlpackage/
+
+# App output
+snapshots/
+runs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.part
