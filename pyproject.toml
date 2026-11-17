@@ -5,10 +5,10 @@ description = "Real-time sharp object detection from the desktop camera using YO
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "ultralytics>=8.3.0",
-    "opencv-python>=4.9",
     "pillow>=10.0",
     # Needed by YOLO-World to encode the custom text prompts
     "clip @ git+https://github.com/ultralytics/CLIP.git",
+    "mediapipe>=1.2.3",
 ]
 
 [tool.uv]
